@@ -1,5 +1,5 @@
 import torch
-from utils import geo_utils, dataset_utils, sparse_utils
+from utils import geo_utils, dataset_utils, sparse_utils, pairwise_utils, visual_utils
 from datasets import Projective, Euclidean
 import os.path
 from pyhocon import ConfigFactory
@@ -8,7 +8,7 @@ import warnings
 
 
 class SceneData:
-    def __init__(self, M, Ns, Ps_gt, scan_name, dilute_M=False):
+    def __init__(self, M, Ns, Ps_gt, scan_name, dilute_M=False, compute_pairwise=True, images_path=None, use_visual_features=False):
         n_images = Ps_gt.shape[0]
 
         # Set attribute
@@ -35,6 +35,40 @@ class SceneData:
 
         # Normalize M
         self.norm_M = geo_utils.normalize_M(M, Ns, self.valid_pts).transpose(1, 2).reshape(n_images * 2, -1)
+        
+        # Compute pairwise information if requested
+        if compute_pairwise:
+            self._compute_pairwise_data()
+        
+        # Add visual features if requested
+        if use_visual_features and images_path is not None:
+            self._add_visual_features(images_path)
+
+    def _compute_pairwise_data(self):
+        """Compute pairwise matches and relative poses for this scene."""
+        try:
+            # Determine if cameras are calibrated based on Ns
+            calibrated = torch.allclose(self.Ns, torch.eye(3, device=self.Ns.device).expand_as(self.Ns), atol=1e-6)
+            
+            # Add pairwise data to scene
+            pairwise_utils.add_pairwise_data_to_scene(self, calibrated=not calibrated)
+        except Exception as e:
+            warnings.warn(f"Failed to compute pairwise data for scene {self.scan_name}: {e}")
+            # Initialize empty dictionaries if computation fails
+            self.matches = {}
+            self.relative_poses = {}
+
+    def _add_visual_features(self, images_path):
+        """Add visual features to the scene data."""
+        try:
+            # Try to add visual features using the visual_utils
+            visual_utils.add_visual_features_to_data(self, images_path, "cnn")
+            print(f"Successfully added visual features to scene {self.scan_name}")
+        except Exception as e:
+            warnings.warn(f"Failed to add visual features to scene {self.scan_name}: {e}")
+            # Create dummy visual features as fallback
+            n_cameras = self.y.shape[0]
+            self.visual_features = torch.randn(n_cameras, 512)  # Default CNN feature dimension
 
     def to(self, *args, **kwargs):
         for key in self.__dict__:
@@ -52,6 +86,11 @@ def create_scene_data(conf):
     scan = conf.get_string('dataset.scan')
     calibrated = conf.get_bool('dataset.calibrated')
     dilute_M = conf.get_bool('dataset.diluteM', default=False)
+    compute_pairwise = conf.get_bool('dataset.compute_pairwise', default=True)
+    
+    # Visual feature settings
+    use_visual_features = conf.get_bool('model.use_visual_features', default=False)
+    images_path = conf.get_string('dataset.images_path', default=None)
 
     # Get raw data
     if calibrated:
@@ -59,7 +98,7 @@ def create_scene_data(conf):
     else:
         M, Ns, Ps_gt = Projective.get_raw_data(conf, scan)
 
-    return SceneData(M, Ns, Ps_gt, scan, dilute_M)
+    return SceneData(M, Ns, Ps_gt, scan, dilute_M, compute_pairwise, images_path, use_visual_features)
 
 
 def sample_data(data, num_samples, adjacent=True):
@@ -75,7 +114,7 @@ def sample_data(data, num_samples, adjacent=True):
     M = data.M[M_indices]
     M = M[:,(M>0).sum(dim=0)>2]
 
-    sampled_data = SceneData(M, Ns, y, data.scan_name)
+    sampled_data = SceneData(M, Ns, y, data.scan_name, compute_pairwise=False)
     if (sampled_data.x.pts_per_cam == 0).any():
         warnings.warn('Cameras with no points for dataset '+ data.scan_name)
 
